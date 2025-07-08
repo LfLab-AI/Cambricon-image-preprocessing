@@ -1,0 +1,166 @@
+#include "opencv2/core.hpp"
+#include "opencv2/imgcodecs.hpp"
+#include <iostream>
+#include <string>
+#include <chrono>
+#include <bang.h>
+
+#define MEASURE_KERNEL_TIME
+
+#define MAX_NRAM_SIZE 655360
+#define CLUSTER_NUM 6
+#define CORE_NUM_PER_CLUSTER 4
+
+__nram__ uint8_t nram_buffer[MAX_NRAM_SIZE];
+__mlu_const__ float grayscale_coefficient[3] = {0.299f, 0.587f, 0.114f};
+
+__mlu_entry__ void gray_hflip_kernel(uint8_t* dst, const uint8_t* src, const int height, const int width) {
+    int rows_per_core = height / taskDim;
+    const int rows_last_core = rows_per_core + height % taskDim;
+
+    const uint8_t *src_offset = src + taskId * rows_per_core * width * 3;
+    uint8_t *dst_offset = dst + taskId * rows_per_core * width;
+
+    if (taskId == taskDim - 1) {
+        rows_per_core = rows_last_core;
+    }
+
+    const unsigned int rows_nram_num = MAX_NRAM_SIZE / (width * sizeof(float) * 4);
+    const unsigned int loop_num = rows_per_core / rows_nram_num;
+    const unsigned int rem_row_nram_num = rows_per_core % rows_nram_num;
+    const unsigned int data_nram_num = rows_nram_num * width;
+    const unsigned int rem_nram_num = rem_row_nram_num * width;
+
+    float *float_src_nram = (float *)nram_buffer;
+    float *float_dst_nram = (float *)(float_src_nram + 3 * data_nram_num);
+    uint8_t *uint8_src_nram = (uint8_t *)float_dst_nram;
+    uint8_t *uint8_dst_nram = (uint8_t *)nram_buffer;
+
+    __wram__ float conv_kernel[48];      // 48 is for byte alignment
+    __memcpy(conv_kernel, grayscale_coefficient, 4 * sizeof(float), GDRAM2WRAM, 64, sizeof(float), 2);
+
+    for (unsigned int i = 0; i < loop_num; i++) {
+        __memcpy(uint8_src_nram, src_offset + i * 3 * data_nram_num, 3 * data_nram_num * sizeof(uint8_t), GDRAM2NRAM);
+        __bang_uchar2float(float_src_nram, uint8_src_nram, 3 * data_nram_num);
+        __bang_conv(float_dst_nram, float_src_nram, conv_kernel, 3, 1, data_nram_num, 1, 1, 1, 1, 1);
+        __bang_float2uchar_rm(uint8_dst_nram, float_dst_nram, data_nram_num);
+        __bang_mirror(uint8_src_nram, uint8_dst_nram, rows_nram_num, width);
+        __memcpy(dst_offset + i * data_nram_num, uint8_src_nram, data_nram_num * sizeof(uint8_t), NRAM2GDRAM);
+    }
+
+    if (rem_row_nram_num != 0) {
+        __memcpy(uint8_src_nram, src_offset + loop_num * 3 * data_nram_num, 3 * rem_nram_num * sizeof(uint8_t), GDRAM2NRAM);
+        __bang_uchar2float(float_src_nram, uint8_src_nram, 3 * rem_nram_num);
+        __bang_conv(float_dst_nram, float_src_nram, conv_kernel, 3, 1, rem_nram_num, 1, 1, 1, 1, 1);
+        __bang_float2uchar_rm(uint8_dst_nram, float_dst_nram, rem_nram_num);
+        __bang_mirror(uint8_src_nram, uint8_dst_nram, rem_row_nram_num, width);
+        __memcpy(dst_offset + loop_num * data_nram_num, uint8_src_nram, rem_nram_num * sizeof(uint8_t), NRAM2GDRAM);
+    }
+}
+
+cv::Mat gray_hflip(const cv::Mat& img) {
+    /*
+     * Converts image to grayscale version and horizontally flips it
+     *
+     * Args:
+     *    img (cv::Mat, CV_8UC3(HWC)): Image to be converted to grayscale and flipped.
+     *    
+     * Returns:
+     *    new_img (cv::Mat): Grayscale version of the fliped image.
+     * 
+     */
+
+    if (img.type() != CV_8UC3) {
+        throw std::invalid_argument("input image is not of type CV_8UC3");
+    }
+
+    const int img_size = img.rows * img.cols;
+    const int num_input_channels = 3;
+    uint8_t *host_src = img.isContinuous()? (uint8_t *)img.data: (uint8_t *)img.clone().data;
+
+#ifdef MEASURE_KERNEL_TIME
+    cnrtNotifier_t notifier_start, notifier_end;
+    CNRT_CHECK(cnrtNotifierCreate(&notifier_start));
+    CNRT_CHECK(cnrtNotifierCreate(&notifier_end));
+#endif
+
+    cnrtQueue_t queue;
+    CNRT_CHECK(cnrtSetDevice(0));
+    CNRT_CHECK(cnrtQueueCreate(&queue));
+
+    cnrtDim3_t dim = {CORE_NUM_PER_CLUSTER, CLUSTER_NUM, 1};
+    cnrtFunctionType_t func_type = CNRT_FUNC_TYPE_BLOCK;
+
+    uint8_t *mlu_src;
+    CNRT_CHECK(cnrtMalloc((void**)&mlu_src, num_input_channels * img_size * sizeof(uint8_t)));
+    CNRT_CHECK(cnrtMemcpy(mlu_src, host_src, num_input_channels * img_size * sizeof(uint8_t), cnrtMemcpyHostToDev));
+
+    uint8_t *mlu_dst;
+    CNRT_CHECK(cnrtMalloc((void**)&mlu_dst, img_size * sizeof(uint8_t)));
+
+#ifdef MEASURE_KERNEL_TIME
+    CNRT_CHECK(cnrtPlaceNotifier(notifier_start, queue));
+#endif
+
+    gray_hflip_kernel<<<dim, func_type, queue>>>(mlu_dst, mlu_src, img.rows, img.cols);
+
+#ifdef MEASURE_KERNEL_TIME
+    CNRT_CHECK(cnrtPlaceNotifier(notifier_end, queue));
+#endif
+
+    cv::Mat new_img(img.rows, img.cols, CV_8UC1);
+    uint8_t *host_dst = (uint8_t *)new_img.data;
+
+    CNRT_CHECK(cnrtQueueSync(queue));
+    CNRT_CHECK(cnrtMemcpy(host_dst, mlu_dst, img_size * sizeof(uint8_t), cnrtMemcpyDevToHost));
+
+    CNRT_CHECK(cnrtFree(mlu_src));
+    CNRT_CHECK(cnrtFree(mlu_dst));
+
+    CNRT_CHECK(cnrtQueueDestroy(queue));
+
+#ifdef MEASURE_KERNEL_TIME
+    float latency = 0.0f;
+    CNRT_CHECK(cnrtNotifierDuration(notifier_start, notifier_end, &latency));
+    std::cout << "[MLU Hardware Time]: " << latency / 1e+6 << " s" << std::endl;
+#endif
+
+    return new_img;
+}
+
+int main(void) {
+    /* single image */
+    const std::string img_path = "../image/src.jpg";
+    const std::string save_path = "../image/dst.jpg";
+    cv::Mat img = cv::imread(img_path);
+    auto start = std::chrono::high_resolution_clock::now();
+    cv::Mat new_img = gray_hflip(img);
+    auto end = std::chrono::high_resolution_clock::now();
+    std::chrono::duration<double> duration = end - start;
+    std::cout << "[Total Time]: " << duration.count() << " s" << std::endl;
+    cv::imwrite(save_path, new_img);
+
+    // const std::string img_path = "/home/sancog/mlu/dataset/ship/";
+    // const std::string save_folder = "/home/sancog/mlu/gsj/image/ship/";
+    // std::vector<cv::String> filenames;
+    // cv::glob(img_path, filenames);
+    // int count = filenames.size();
+    // std::chrono::duration<double> time0;
+    // auto time_stamp0 = std::chrono::high_resolution_clock::now();
+    // for(int i = 0; i < count; ++i) {
+    //     cv::Mat image = cv::imread(filenames[i]);
+    //     auto time_stamp1 = std::chrono::high_resolution_clock::now();
+    //     cv::Mat new_img = gray_hflip(image);
+    //     auto time_stamp2 = std::chrono::high_resolution_clock::now();
+    //     time0 += time_stamp2 - time_stamp1;
+    //     std::string save_path = save_folder + "/" + filenames[i].substr(filenames[i].find_last_of("/\\") + 1);
+    //     cv::imwrite(save_path, new_img);
+    // }
+    // auto time_stamp3 = std::chrono::high_resolution_clock::now();
+    // std::chrono::duration<double> time1 = time_stamp3 - time_stamp0;
+    // std::cout << "The number of images: " << count << std::endl; 
+    // std::cout << "The average time to process an image without I/O: " << time0.count() / count << " s" << std::endl;
+    // std::cout << "The average time to process an image with I/O: " << time1.count() / count << " s" << std::endl;
+
+    return 0;
+}

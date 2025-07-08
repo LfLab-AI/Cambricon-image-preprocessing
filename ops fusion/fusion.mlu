@@ -1,0 +1,189 @@
+#include <bang.h>
+#include <string.h>
+
+#define MAX_NRAM_SIZE 655360
+#define CLUSTER_NUM 6
+#define CORE_NUM_PER_CLUSTER 4
+
+cnrtQueue_t __queue;
+__nram__ uint8_t nram_buffer[MAX_NRAM_SIZE];
+
+__mlu_const__ float grayscale_coefficient[3] = {0.299f, 0.587f, 0.114f};
+
+__mlu_entry__ void gray_hflip_kernel(uint8_t* dst, const uint8_t* src, const int height, const int width) {
+    int rows_per_core = height / taskDim;
+    const int rows_last_core = rows_per_core + height % taskDim;
+
+    const uint8_t *src_offset = src + taskId * rows_per_core * width * 3;
+    uint8_t *dst_offset = dst + taskId * rows_per_core * width;
+
+    if (taskId == taskDim - 1) {
+        rows_per_core = rows_last_core;
+    }
+
+    const unsigned int rows_nram_num = MAX_NRAM_SIZE / (width * sizeof(float) * 4);
+    const unsigned int loop_num = rows_per_core / rows_nram_num;
+    const unsigned int rem_row_nram_num = rows_per_core % rows_nram_num;
+    const unsigned int data_nram_num = rows_nram_num * width;
+    const unsigned int rem_nram_num = rem_row_nram_num * width;
+
+    float *float_src_nram = (float *)nram_buffer;
+    float *float_dst_nram = (float *)(float_src_nram + 3 * data_nram_num);
+    uint8_t *uint8_src_nram = (uint8_t *)float_dst_nram;
+    uint8_t *uint8_dst_nram = (uint8_t *)nram_buffer;
+
+    __wram__ float conv_kernel[48];      // 48 is for byte alignment
+    __memcpy(conv_kernel, grayscale_coefficient, 4 * sizeof(float), GDRAM2WRAM, 64, sizeof(float), 2);
+
+    for (unsigned int i = 0; i < loop_num; i++) {
+        __memcpy(uint8_src_nram, src_offset + i * 3 * data_nram_num, 3 * data_nram_num * sizeof(uint8_t), GDRAM2NRAM);
+        __bang_uchar2float(float_src_nram, uint8_src_nram, 3 * data_nram_num);
+        __bang_conv(float_dst_nram, float_src_nram, conv_kernel, 3, 1, data_nram_num, 1, 1, 1, 1, 1);
+        __bang_float2uchar_rm(uint8_dst_nram, float_dst_nram, data_nram_num);
+        __bang_mirror(uint8_src_nram, uint8_dst_nram, rows_nram_num, width);
+        __memcpy(dst_offset + i * data_nram_num, uint8_src_nram, data_nram_num * sizeof(uint8_t), NRAM2GDRAM);
+    }
+
+    if (rem_row_nram_num != 0) {
+        __memcpy(uint8_src_nram, src_offset + loop_num * 3 * data_nram_num, 3 * rem_nram_num * sizeof(uint8_t), GDRAM2NRAM);
+        __bang_uchar2float(float_src_nram, uint8_src_nram, 3 * rem_nram_num);
+        __bang_conv(float_dst_nram, float_src_nram, conv_kernel, 3, 1, rem_nram_num, 1, 1, 1, 1, 1);
+        __bang_float2uchar_rm(uint8_dst_nram, float_dst_nram, rem_nram_num);
+        __bang_mirror(uint8_src_nram, uint8_dst_nram, rem_row_nram_num, width);
+        __memcpy(dst_offset + loop_num * data_nram_num, uint8_src_nram, rem_nram_num * sizeof(uint8_t), NRAM2GDRAM);
+    }
+}
+
+__mlu_entry__ void resize_hflip_kernel(uint8_t* dst, const uint8_t* src, const uint32_t* index, const int dst_height, const int dst_width, const int src_height, const int src_width) {
+    int rows_per_core = dst_height / taskDim;
+    const int rows_last_core = rows_per_core + dst_height % taskDim;
+
+    uint8_t *dst_offset = dst + taskId * rows_per_core * dst_width * 3;
+    const uint32_t *index_offset = index + taskId * rows_per_core * dst_width * 3;
+
+    if (taskId == taskDim - 1) {
+        rows_per_core = rows_last_core;
+    }
+
+    const int scale = src_height / dst_height + 1;
+    const int max_size1 = (6 * dst_width + 3 * src_width * scale) * sizeof(uint32_t);
+    const int max_size2 = 3 * src_width * scale * (sizeof(uint8_t) + sizeof(uint32_t));
+    const int max_size = (max_size1 > max_size2) ? max_size1 : max_size2;
+    const unsigned int rows_nram_num = MAX_NRAM_SIZE / max_size;
+    const unsigned int loop_num = rows_per_core / rows_nram_num;
+    const unsigned int rem_row_nram_num = rows_per_core % rows_nram_num;
+    const unsigned int data_nram_num = rows_nram_num * dst_width;
+    const unsigned int rem_nram_num = rem_row_nram_num * dst_width;
+
+    int32_t *src_32b_nram = (int32_t *)nram_buffer;
+    int32_t *dst_32b_nram = (int32_t *)(src_32b_nram + 3 * rows_nram_num * src_width * scale);
+    uint32_t *index_nram = (uint32_t *)(dst_32b_nram + 3 * data_nram_num);
+    uint8_t *src_8b_nram = (uint8_t *)index_nram;
+    uint8_t *dst_8b_nram = (uint8_t *)nram_buffer;
+
+    for (unsigned int i = 0; i < loop_num; i++) {
+        int min_index = *(index_offset + i * 3 * data_nram_num);
+        __memcpy(src_8b_nram, src + min_index, 3 * rows_nram_num * src_width * scale * sizeof(uint8_t), GDRAM2NRAM);
+        __bang_uchar2int32(src_32b_nram, src_8b_nram, 3 * rows_nram_num * src_width * scale, 0);
+        __memcpy(index_nram, index_offset + i * 3 * data_nram_num, 3 * data_nram_num * sizeof(uint32_t), GDRAM2NRAM);
+        __bang_sub_scalar(index_nram, index_nram, min_index, 3 * data_nram_num);
+        __bang_lut(dst_32b_nram, index_nram, src_32b_nram, 3 * data_nram_num, 3 * rows_nram_num * src_width * scale);
+        __bang_int322uchar(src_8b_nram, dst_32b_nram, 3 * data_nram_num, 0);
+        __bang_mirror(dst_8b_nram, src_8b_nram, rows_nram_num, 3 * dst_width);
+        __memcpy(dst_offset + i * 3 * data_nram_num, dst_8b_nram, 3 * data_nram_num * sizeof(uint8_t), NRAM2GDRAM);
+    }
+
+    if (rem_row_nram_num != 0) {
+        int min_index = *(index_offset + loop_num * 3 * data_nram_num);
+        __memcpy(src_8b_nram, src + min_index, 3 * rem_row_nram_num * src_width * scale * sizeof(uint8_t), GDRAM2NRAM);
+        __bang_uchar2int32(src_32b_nram, src_8b_nram, 3 * rem_row_nram_num * src_width * scale, 0);
+        __memcpy(index_nram, index_offset + loop_num * 3 * data_nram_num, 3 * rem_nram_num * sizeof(uint32_t), GDRAM2NRAM);
+        __bang_sub_scalar(index_nram, index_nram, min_index, 3 * rem_nram_num);
+        __bang_lut(dst_32b_nram, index_nram, src_32b_nram, 3 * rem_nram_num, 3 * rem_row_nram_num * src_width * scale);
+        __bang_int322uchar(src_8b_nram, dst_32b_nram, 3 * rem_nram_num, 0);
+        __bang_mirror(dst_8b_nram, src_8b_nram, rem_row_nram_num, 3 * dst_width);
+        __memcpy(dst_offset + loop_num * 3 * data_nram_num, dst_8b_nram, 3 * rem_nram_num * sizeof(uint8_t), NRAM2GDRAM);
+    }
+}
+
+
+extern "C" {
+    void initialize() {
+        CNRT_CHECK(cnrtSetDevice(0));
+        CNRT_CHECK(cnrtQueueCreate(&__queue));
+    }
+
+    void release() {
+        CNRT_CHECK(cnrtQueueDestroy(__queue));
+    }
+
+    void gray_hflip(uint8_t *host_dst, uint8_t *host_src, const int height, const int width) {    
+        cnrtDim3_t dim = {CORE_NUM_PER_CLUSTER, CLUSTER_NUM, 1};
+        cnrtFunctionType_t func_type = CNRT_FUNC_TYPE_BLOCK;
+
+        const int img_size = height * width;
+    
+        uint8_t *mlu_src;
+        CNRT_CHECK(cnrtMalloc((void**)&mlu_src, 3 * img_size * sizeof(uint8_t)));
+        CNRT_CHECK(cnrtMemcpy(mlu_src, host_src, 3 * img_size * sizeof(uint8_t), cnrtMemcpyHostToDev));
+    
+        uint8_t *mlu_dst;
+        CNRT_CHECK(cnrtMalloc((void**)&mlu_dst, img_size * sizeof(uint8_t)));
+    
+        gray_hflip_kernel<<<dim, func_type, __queue>>>(mlu_dst, mlu_src, height, width);
+    
+        CNRT_CHECK(cnrtQueueSync(__queue));
+        CNRT_CHECK(cnrtMemcpy(host_dst, mlu_dst, img_size * sizeof(uint8_t), cnrtMemcpyDevToHost));
+    
+        CNRT_CHECK(cnrtFree(mlu_src));
+        CNRT_CHECK(cnrtFree(mlu_dst));
+    }
+
+    void resize_hflip(uint8_t *host_dst, uint8_t *host_src, const int dst_height, const int dst_width, const int src_height, const int src_width) {
+        const int channels = 3;
+        const int newImg_size = channels * dst_width * dst_height;
+        float scale_x = (float)src_width / (float)dst_width;
+        float scale_y = (float)src_height / (float)dst_height;
+        uint32_t *index = (uint32_t *)malloc(newImg_size * sizeof(uint32_t));
+
+        const int stepDst = channels * dst_width;
+        const int stepSrc = channels * src_width;
+
+        for (int j = 0; j < dst_height; ++j) {
+            for (int i = 0; i < dst_width; ++i) {
+                int sx = static_cast<int>(i * scale_x);
+                int sy = static_cast<int>(j * scale_y);
+                sx = fmin(sx, src_width - 1);
+                sy = fmin(sy, src_height - 1);
+                index[j * stepDst + i * channels] = sy * stepSrc + sx * channels;
+                index[j * stepDst + i * channels + 1] = sy * stepSrc + sx * channels + 1;
+                index[j * stepDst + i * channels + 2] = sy * stepSrc + sx * channels + 2;
+            }
+        }
+
+        cnrtDim3_t dim = {CORE_NUM_PER_CLUSTER, CLUSTER_NUM, 1};
+        cnrtFunctionType_t func_type = CNRT_FUNC_TYPE_BLOCK;
+
+        uint8_t *mlu_src;
+        CNRT_CHECK(cnrtMalloc((void**)&mlu_src, channels * src_width * src_height * sizeof(uint8_t)));
+        CNRT_CHECK(cnrtMemcpy(mlu_src, host_src, channels * src_width * src_height * sizeof(uint8_t), cnrtMemcpyHostToDev));
+
+        uint8_t *mlu_dst;
+        CNRT_CHECK(cnrtMalloc((void**)&mlu_dst, newImg_size * sizeof(uint8_t)));
+
+        uint32_t *mlu_index;
+        CNRT_CHECK(cnrtMalloc((void**)&mlu_index, newImg_size * sizeof(uint32_t)));
+        CNRT_CHECK(cnrtMemcpy(mlu_index, index, newImg_size * sizeof(uint32_t), cnrtMemcpyHostToDev));
+
+        resize_hflip_kernel<<<dim, func_type, __queue>>>(mlu_dst, mlu_src, mlu_index, dst_height, dst_width, src_height, src_width);
+
+        CNRT_CHECK(cnrtQueueSync(__queue));
+        CNRT_CHECK(cnrtMemcpy(host_dst, mlu_dst, newImg_size * sizeof(uint8_t), cnrtMemcpyDevToHost));
+
+        CNRT_CHECK(cnrtFree(mlu_src));
+        CNRT_CHECK(cnrtFree(mlu_dst));
+        CNRT_CHECK(cnrtFree(mlu_index));
+
+        free(index);
+    }
+}
