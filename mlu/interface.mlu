@@ -133,16 +133,12 @@ __mlu_entry__ void Kernel_erase(uint8_t* data, uint8_t v, int src_width, int wid
              num_curr_chunk * sizeof(uint8_t), NRAM2GDRAM);
 }
 
-
-
 __mlu_entry__ void Kernel_affine(int *idxs, int p_if_outbound,
                                  float a, float b, float c,
                                  float d, float e, float f,
                                  int height, int width, int channels)
 {    
-    int instr_count = 0;
     int rows_per_core = height / taskDim;
-    int rows_last_core = height % taskDim;
     int row_start = taskId * rows_per_core;
     int row_end = taskId == taskDim - 1 ? height : (taskId + 1) * rows_per_core;
     
@@ -154,15 +150,28 @@ __mlu_entry__ void Kernel_affine(int *idxs, int p_if_outbound,
     float* src_ys = (float*)(src_xs + data_nram_num);
     float* temp = (float*)(src_ys + data_nram_num);
 
-    int* lut = (int*)(temp + data_nram_num);
-    int* temp1 = (int*)(lut + data_nram_num);
+    int* lut_ping = (int*)(temp + data_nram_num);
+    int* lut_pong = (int*)(lut_ping + width);
+    int* temp1 = (int*)(lut_pong + width);
     int* temp2 = (int*)(temp1 + data_nram_num);
     
     for (int x = 0; x < width; x++)
         xs[x] = (float)x;
-    // count = 2048 * 2048 * (2 * 2 + 3 * 15 + 4 * 6 + 2) + 2048 * 24 * 2 = 281,018,368
+
+    int* current_lut = lut_ping;
+    int* prev_lut = nullptr;
+    int prev_y = -1;
+
     for (int y = row_start; y < row_end; y++)
     {
+        // Swap buffers
+        int* next_lut = (current_lut == lut_ping) ? lut_pong : lut_ping;
+        
+        // If not the first iteration, start asynchronous copy of previous results
+        if (prev_y >= 0) {
+            __memcpy_async(idxs + prev_y * width, prev_lut, width * sizeof(int), NRAM2GDRAM);
+        }
+
         __memset_nram(ys, width, (float)y);
 
         __bang_mul_scalar(src_xs, xs, a, width);
@@ -175,35 +184,110 @@ __mlu_entry__ void Kernel_affine(int *idxs, int p_if_outbound,
         __bang_add(src_ys, src_ys, temp, width);
         __bang_add_scalar(src_ys, src_ys, f, width);
 
-        // construct mask
-        __bang_float2int_rm(lut, src_xs, width, POS);
-        __bang_ge_scalar(temp1, lut, 0, width);
-        __bang_lt_scalar(temp2, lut, width, width);
+        // Construct mask
+        __bang_float2int_rm(current_lut, src_xs, width, POS);
+        __bang_ge_scalar(temp1, current_lut, 0, width);
+        __bang_lt_scalar(temp2, current_lut, width, width);
         __bang_band(temp1, temp1, temp2, width);
 
-        __bang_float2int32_rm(lut, src_ys, width, POS);
-        __bang_ge_scalar(temp2, lut, 0, width);
-        __bang_lt_scalar(lut, lut, height, width);
-        __bang_band(temp2, temp2, lut, width);
+        __bang_float2int32_rm(current_lut, src_ys, width, POS);
+        __bang_ge_scalar(temp2, current_lut, 0, width);
+        __bang_lt_scalar(current_lut, current_lut, height, width);
+        __bang_band(temp2, temp2, current_lut, width);
 
-        // now temp1 is the mask for lut, 1 stands for valid
+        // Now temp1 is the mask for lut, 1 stands for valid
         __bang_band(temp1, temp1, temp2, width);
 
-        // construct raw lut
-        __bang_float2int32_rm(lut, src_ys, width, POS);
+        // Construct raw lut
+        __bang_float2int32_rm(current_lut, src_ys, width, POS);
         __bang_float2int32_rm(temp2, src_xs, width, POS);
-        __bang_mul_scalar(lut, lut, width, width);
-        __bang_add(lut, lut, temp2, width);
+        __bang_mul_scalar(current_lut, current_lut, width, width);
+        __bang_add(current_lut, current_lut, temp2, width);
         
-        // filter
-        __bang_mul(lut, lut, temp1, width);
+        // Filter
+        __bang_mul(current_lut, current_lut, temp1, width);
         
-        // move
-        __memcpy(idxs + y * width, lut, width * sizeof(int), NRAM2GDRAM);
+        // Synchronize to ensure previous memcpy is complete before overwriting the buffer
+        __sync();
+
+        prev_lut = current_lut;
+        current_lut = next_lut;
+        prev_y = y;
+    }
+
+    // Copy the last row's results
+    if (prev_y >= 0) {
+        __memcpy(idxs + prev_y * width, prev_lut, width * sizeof(int), NRAM2GDRAM);
     }
 }
 
+// __mlu_entry__ void Kernel_affine_optimize(int *idxs, int p_if_outbound,
+//                                  float a, float b, float c,
+//                                  float d, float e, float f,
+//                                  int height, int width, int channels)
+// {    
+//     int instr_count = 0;
+//     int rows_per_core = height / taskDim;
+//     int rows_last_core = height % taskDim;
+//     int row_start = taskId * rows_per_core;
+//     int row_end = taskId == taskDim - 1 ? height : (taskId + 1) * rows_per_core;
+    
+//     int data_nram_num = 3000;
 
+//     float* xs = (float*)nram_buffer;
+//     float* ys = (float*)(xs + data_nram_num);
+//     float* src_xs = (float*)(ys + data_nram_num);
+//     float* src_ys = (float*)(src_xs + data_nram_num);
+//     float* temp = (float*)(src_ys + data_nram_num);
+
+//     int* lut = (int*)(temp + data_nram_num);
+//     int* temp1 = (int*)(lut + data_nram_num);
+//     int* temp2 = (int*)(temp1 + data_nram_num);
+    
+//     for (int x = 0; x < width; x++)
+//         xs[x] = (float)x;
+//     // count = 2048 * 2048 * (2 * 2 + 3 * 15 + 4 * 6 + 2) + 2048 * 24 * 2 = 281,018,368
+//     for (int y = row_start; y < row_end; y++)
+//     {
+//         __memset_nram(ys, width, (float)y);
+
+//         __bang_mul_scalar(src_xs, xs, a, width);
+//         __bang_mul_scalar(temp, ys, b, width);
+//         __bang_add(src_xs, src_xs, temp, width);
+//         __bang_add_scalar(src_xs, src_xs, c, width);
+
+//         __bang_mul_scalar(src_ys, xs, d, width);
+//         __bang_mul_scalar(temp, ys, e, width);
+//         __bang_add(src_ys, src_ys, temp, width);
+//         __bang_add_scalar(src_ys, src_ys, f, width);
+
+//         // construct mask
+//         __bang_float2int_rm(lut, src_xs, width, POS);
+//         __bang_ge_scalar(temp1, lut, 0, width);
+//         __bang_lt_scalar(temp2, lut, width, width);
+//         __bang_band(temp1, temp1, temp2, width);
+
+//         __bang_float2int32_rm(lut, src_ys, width, POS);
+//         __bang_ge_scalar(temp2, lut, 0, width);
+//         __bang_lt_scalar(lut, lut, height, width);
+//         __bang_band(temp2, temp2, lut, width);
+
+//         // now temp1 is the mask for lut, 1 stands for valid
+//         __bang_band(temp1, temp1, temp2, width);
+
+//         // construct raw lut
+//         __bang_float2int32_rm(lut, src_ys, width, POS);
+//         __bang_float2int32_rm(temp2, src_xs, width, POS);
+//         __bang_mul_scalar(lut, lut, width, width);
+//         __bang_add(lut, lut, temp2, width);
+        
+//         // filter
+//         __bang_mul(lut, lut, temp1, width);
+        
+//         // move
+//         __memcpy(idxs + y * width, lut, width * sizeof(int), NRAM2GDRAM);
+//     }
+// }
 
 
 
@@ -349,6 +433,8 @@ void getPerspectiveTransform(const int *src, const int *dst, float *TransformMat
     TransformMatrix[8] = 1.0f;
 
 }
+
+
 
 __mlu_global__ void perspective_kernel(uint32_t *transformed_Grid, const float *transform_Matrix, const int rows, const int cols) {
     // Divide the image into rows and assign them to each core for processing
@@ -507,6 +593,170 @@ __mlu_global__ void perspective_kernel(uint32_t *transformed_Grid, const float *
     }
 }
 
+
+// __mlu_global__ void perspective_kernel_optimize(uint32_t *transformed_Grid, const float *transform_Matrix, const int rows, const int cols) {
+//     // Divide the image into rows and assign them to each core for processing
+//     unsigned int rows_per_core = rows / taskDim;
+//     const unsigned int rows_last_core = rows_per_core + rows % taskDim;
+//     unsigned int grid_y = taskId * rows_per_core;
+
+//     if (taskId == taskDim - 1) {
+//         rows_per_core = rows_last_core;
+//     }
+
+//     // Copy the perspective transformation matrix to WRAM space
+//     __wram__ float wram_transformMatrix[48];   // 48 = 64 x 3 / sizeof(float), the extra space is for byte alignment
+//     __memcpy(wram_transformMatrix, transform_Matrix, 4 * sizeof(float), GDRAM2WRAM, 64, 3 * sizeof(float), 2);
+
+//     // Due to the limited space of NRAM, the data will be copied in batches into NRAM for vector calculation
+//     const unsigned int rows_per_nram = (MAX_NRAM_SIZE / sizeof(float) - cols) / 6 / cols;
+//     const unsigned int loop_num = rows_per_core / rows_per_nram;
+//     const unsigned int rem_rows = rows_per_core % rows_per_nram;
+//     const unsigned int data_nram_num = rows_per_nram * cols;
+//     const unsigned int rem_nram_num = rem_rows * cols;
+
+//     __wram__ int8_t mat[256*256*4];
+//     float *float_src_nram = (float *)nram_buffer;
+//     float *float_dst_nram = (float *)(float_src_nram + 3 * 1000);
+//     int8_t *int8_src_nram = (int8_t *)nram_buffer;
+//     int16_t *int16_dst_nram = (int16_t *)float_dst_nram;
+//     __bang_matmul(int16_dst_nram, int8_src_nram, mat, 256, 256, 256, 0);
+
+//     // Define ping-pong buffers in NRAM
+//     float *buffer_ping = (float *)nram_buffer;
+//     float *buffer_pong = (float *)(buffer_ping + 3 * data_nram_num); // Ensure NRAM has space for 2 buffers
+
+//     float *float_nram0 = (float *)(buffer_ping + 3 * data_nram_num); // Temp buffers after ping-pong space
+//     float *float_nram1 = (float *)(float_nram0 + data_nram_num);
+//     float *float_nram2 = (float *)(float_nram1 + data_nram_num);
+//     float *float_nram3 = (float *)(float_nram2 + data_nram_num);
+//     float *float_nram4 = (float *)(float_nram3 + data_nram_num);
+//     float *float_nram5 = (float *)(float_nram4 + data_nram_num);
+
+//     uint32_t *uint32_nram0 = (uint32_t *)float_nram0;
+//     uint32_t *uint32_nram1 = (uint32_t *)float_nram1;
+//     uint32_t *uint32_nram2 = (uint32_t *)float_nram2;
+//     uint32_t *uint32_nram3 = (uint32_t *)float_nram3;
+
+//     uint32_t *grid0 = transformed_Grid + 3 * grid_y * cols;
+
+//     // Preload grid_x into NRAM (shared across all batches)
+//     __memcpy(buffer_ping, grid_x, cols * sizeof(float), GDRAM2NRAM);
+
+//     // Prefetch first batch into ping buffer
+//     if (loop_num > 0) {
+//         for (unsigned int j = 0; j < rows_per_nram; ++j) {
+//             __memcpy(buffer_ping + j * cols, buffer_ping, cols * sizeof(float), NRAM2NRAM);
+//             __memset_nram(buffer_ping + data_nram_num + j * cols, cols, (float)(grid_y + j));
+//         }
+//         __memset_nram(buffer_ping + 2 * data_nram_num, data_nram_num, 1.0f);
+//     }
+
+//     // Main loop with ping-pong buffering
+//     for (unsigned int i = 0; i < loop_num; ++i) {
+//         float *current_buffer = (i % 2 == 0) ? buffer_ping : buffer_pong;
+//         float *next_buffer = (i % 2 == 0) ? buffer_pong : buffer_ping;
+
+//         // Prefetch next batch asynchronously (if not the last iteration)
+//         if (i < loop_num - 1) {
+//             unsigned int next_grid_y = grid_y + rows_per_nram;
+//             for (unsigned int j = 0; j < rows_per_nram; ++j) {
+//                 __memcpy(next_buffer + j * cols, buffer_ping, cols * sizeof(float), NRAM2NRAM); // Assuming async capability
+//                 __memset_nram(next_buffer + data_nram_num + j * cols, cols, (float)(next_grid_y + j));
+//             }
+//             __memset_nram(next_buffer + 2 * data_nram_num, data_nram_num, 1.0f);
+//         }
+
+//         // Compute on current buffer
+//         __bang_transpose(float_nram3, current_buffer, 3, data_nram_num);
+//         __bang_matmul(float_nram0, float_nram3, wram_transformMatrix, data_nram_num, 3, 3);
+//         __bang_transpose(float_nram3, float_nram0, data_nram_num, 3);
+
+//         __bang_recip(float_nram5, float_nram5, data_nram_num);
+//         __bang_mul(float_nram3, float_nram3, float_nram5, data_nram_num);
+//         __bang_mul(float_nram4, float_nram4, float_nram5, data_nram_num);
+
+//         __bang_lt_scalar(float_nram0, float_nram3, (float)cols, data_nram_num);
+//         __bang_ge_scalar(float_nram1, float_nram3, 0.0f, data_nram_num);
+//         __bang_band((char *)float_nram0, (char *)float_nram0, (char *)float_nram1, data_nram_num * sizeof(float));
+
+//         __bang_lt_scalar(float_nram1, float_nram4, (float)rows, data_nram_num);
+//         __bang_ge_scalar(float_nram2, float_nram4, 0.0f, data_nram_num);
+//         __bang_band((char *)float_nram1, (char *)float_nram1, (char *)float_nram2, data_nram_num * sizeof(float));
+
+//         __bang_band((char *)float_nram0, (char *)float_nram0, (char *)float_nram1, data_nram_num * sizeof(float));
+
+//         __bang_mul(float_nram1, float_nram0, float_nram3, data_nram_num);
+//         __bang_mul(float_nram2, float_nram0, float_nram4, data_nram_num);
+
+//         // NEAREST
+//         __bang_float2uint32_rm(uint32_nram1, float_nram1, 2 * data_nram_num, 0);
+
+//         __bang_fusion(FUSION_FMA, uint32_nram0, uint32_nram2, (uint32_t)cols, uint32_nram1, data_nram_num, data_nram_num);
+
+//         __bang_mul_scalar(uint32_nram0, uint32_nram0, 3, data_nram_num);
+//         __bang_add_scalar(uint32_nram1, uint32_nram0, 1, data_nram_num);
+//         __bang_add_scalar(uint32_nram2, uint32_nram0, 2, data_nram_num);
+
+//         __bang_transpose(uint32_nram3, uint32_nram0, 3, data_nram_num);
+//         __memcpy(grid0 + i * 3 * data_nram_num, uint32_nram3, 3 * data_nram_num * sizeof(uint32_t), NRAM2GDRAM);
+
+//         grid_y += rows_per_nram;
+//     }
+
+//     // Handle remaining rows
+//     if (rem_nram_num != 0) {
+//         float_nram1 = (float *)(float_nram0 + rem_nram_num);
+//         float_nram2 = (float *)(float_nram1 + rem_nram_num);
+//         float_nram3 = (float *)(float_nram2 + rem_nram_num);
+//         float_nram4 = (float *)(float_nram3 + rem_nram_num);
+//         float_nram5 = (float *)(float_nram4 + rem_nram_num);
+
+//         uint32_nram1 = (uint32_t *)float_nram1;
+//         uint32_nram2 = (uint32_t *)float_nram2;
+//         uint32_nram3 = (uint32_t *)float_nram3;
+
+//         for (unsigned int j = 0; j < rem_rows; ++j) {
+//             __memcpy(float_nram0 + j * cols, buffer_ping, cols * sizeof(float), NRAM2NRAM);
+//             __memset_nram(float_nram1 + j * cols, cols, (float)(grid_y + j));
+//         }
+//         __memset_nram(float_nram2, rem_nram_num, 1.0f);
+
+//         __bang_transpose(float_nram3, float_nram0, 3, rem_nram_num);
+//         __bang_matmul(float_nram0, float_nram3, wram_transformMatrix, rem_nram_num, 3, 3);
+//         __bang_transpose(float_nram3, float_nram0, rem_nram_num, 3);
+
+//         __bang_recip(float_nram5, float_nram5, rem_nram_num);
+//         __bang_mul(float_nram3, float_nram3, float_nram5, rem_nram_num);
+//         __bang_mul(float_nram4, float_nram4, float_nram5, rem_nram_num);
+
+//         __bang_lt_scalar(float_nram0, float_nram3, (float)cols, rem_nram_num);
+//         __bang_ge_scalar(float_nram1, float_nram3, 0.0f, rem_nram_num);
+//         __bang_band((char *)float_nram0, (char *)float_nram0, (char *)float_nram1, rem_nram_num * sizeof(float));
+
+//         __bang_lt_scalar(float_nram1, float_nram4, (float)rows, rem_nram_num);
+//         __bang_ge_scalar(float_nram2, float_nram4, 0.0f, rem_nram_num);
+//         __bang_band((char *)float_nram1, (char *)float_nram1, (char *)float_nram2, rem_nram_num * sizeof(float));
+
+//         __bang_band((char *)float_nram0, (char *)float_nram0, (char *)float_nram1, rem_nram_num * sizeof(float));
+
+//         __bang_mul(float_nram1, float_nram0, float_nram3, rem_nram_num);
+//         __bang_mul(float_nram2, float_nram0, float_nram4, rem_nram_num);
+
+//         // NEAREST
+//         __bang_float2uint32_rm(uint32_nram1, float_nram1, 2 * rem_nram_num, 0);
+
+//         __bang_fusion(FUSION_FMA, uint32_nram0, uint32_nram2, (uint32_t)cols, uint32_nram1, rem_nram_num, rem_nram_num);
+
+//         __bang_mul_scalar(uint32_nram0, uint32_nram0, 3, rem_nram_num);
+//         __bang_add_scalar(uint32_nram1, uint32_nram0, 1, rem_nram_num);
+//         __bang_add_scalar(uint32_nram2, uint32_nram0, 2, rem_nram_num);
+
+//         __bang_transpose(uint32_nram3, uint32_nram0, 3, rem_nram_num);
+//         __memcpy(grid0 + loop_num * 3 * data_nram_num, uint32_nram3, 3 * rem_nram_num *  sizeof(uint32_t), NRAM2GDRAM);
+//     }
+// }
+
 __mlu_global__ void Flip_Kernel(uint8_t* dst, const uint8_t* src,const int width,const int height) {
     //printf("t %d",taskId);
     const uint8_t *src_offset = src + taskId * width*3;
@@ -524,7 +774,7 @@ __mlu_global__ void Flip_Kernel(uint8_t* dst, const uint8_t* src,const int width
 typedef unsigned char uchar;
 __nram__ float min_index[1];
 __nram__ float max_index[1];
-__mlu_global__ void resizeNearestKernel(uchar* dst, const uchar* src, const uint32_t* index, uint src_size, uint dst_size) {
+__mlu_global__ void resizeKernel(uchar* dst, const uchar* src, const uint32_t* index, uint src_size, uint dst_size) {
 
     const unsigned int data_nram_num = MAX_NRAM_SIZE / 11;
 
@@ -580,38 +830,6 @@ __mlu_global__ void resizeNearestKernel(uchar* dst, const uchar* src, const uint
         __bang_int322uchar(src1, src2, current_index_chunk_size, 0);
         __memcpy(dst + i, src1, current_index_chunk_size * sizeof(uchar), NRAM2GDRAM);
     }
-
-    /*int data_num_mlu = mul * mul;
-    int32_t data_per_core_mlu = data_num_mlu / taskDim;
-    int32_t data_last_core_mlu = data_per_core_mlu + data_num_mlu % taskDim;
-    const float* src0_offset_mlu = src0_mlu + taskId * data_per_core_mlu;
-    const float* src1_offset_mlu = src1_mlu + taskId * data_per_core_mlu;
-    float* dst_offset_mlu = dst_mlu + taskId * data_per_core_mlu;
-
-    if (taskId == taskDim - 1) {
-        data_per_core_mlu = data_last_core_mlu;
-    }
-
-    const unsigned int data_nram_num_mlu = 256*256;
-    const unsigned int loop_num_mlu = data_per_core_mlu / data_nram_num_mlu;
-    const unsigned int rem_nram_num_mlu = data_per_core_mlu % data_nram_num_mlu;  
-    
-    float *float_src0_nram_mlu = (float *)(nram_buffer);
-    float *float_dst_nram_mlu = (float *)(nram_buffer);
-    __wram__ float float_src1_nram_mlu[data_nram_num_mlu];
-
-    for (unsigned int i = 0; i < loop_num_mlu; ++i){
-        __memcpy(float_src0_nram_mlu, src0_offset_mlu + i * data_nram_num_mlu, data_nram_num_mlu * sizeof(float), GDRAM2NRAM);
-        __memcpy(float_src1_nram_mlu, src1_offset_mlu + i * data_nram_num_mlu, data_nram_num_mlu * sizeof(float), GDRAM2WRAM);
-        __bang_matmul(float_dst_nram_mlu, float_src0_nram_mlu, float_src1_nram_mlu, 256, 256, 256);
-        __memcpy(dst_offset_mlu + i * data_nram_num_mlu, float_dst_nram_mlu, data_nram_num_mlu * sizeof(float), NRAM2GDRAM);
-    }
-    if (rem_nram_num_mlu != 0){
-        __memcpy(float_src0_nram_mlu, src0_offset_mlu + loop_num_mlu * rem_nram_num_mlu, rem_nram_num_mlu * sizeof(float), GDRAM2NRAM);
-        __memcpy(float_src1_nram_mlu, src1_offset_mlu + loop_num_mlu * rem_nram_num_mlu, rem_nram_num_mlu * sizeof(float), GDRAM2WRAM);
-        __bang_matmul(float_dst_nram_mlu, float_src0_nram_mlu, float_src1_nram_mlu, 256, 256, 256);
-        __memcpy(dst_offset_mlu + loop_num_mlu * rem_nram_num_mlu, float_dst_nram_mlu, rem_nram_num_mlu * sizeof(float), NRAM2GDRAM);
-    }*/
 }
 
 __mlu_global__ void adjustContrastKernel(uint8_t* dst, const uint8_t* src, const int data_num, const float alpha) {
@@ -654,38 +872,6 @@ __mlu_global__ void adjustContrastKernel(uint8_t* dst, const uint8_t* src, const
         __memcpy(dst_offset + loop_num * data_nram_num, uint8_dst_nram, rem_nram_num * sizeof(uint8_t), NRAM2GDRAM);
     }
 
-    /*int data_num_mlu = mul * mul;
-    int32_t data_per_core_mlu = data_num_mlu / taskDim;
-    int32_t data_last_core_mlu = data_per_core_mlu + data_num_mlu % taskDim;
-    const float* src0_offset_mlu = src0_mlu + taskId * data_per_core_mlu;
-    const float* src1_offset_mlu = src1_mlu + taskId * data_per_core_mlu;
-    float* dst_offset_mlu = dst_mlu + taskId * data_per_core_mlu;
-
-    if (taskId == taskDim - 1) {
-        data_per_core_mlu = data_last_core_mlu;
-    }
-
-    const unsigned int data_nram_num_mlu = 256*256;
-    const unsigned int loop_num_mlu = data_per_core_mlu / data_nram_num_mlu;
-    const unsigned int rem_nram_num_mlu = data_per_core_mlu % data_nram_num_mlu;  
-    
-    float *float_src0_nram_mlu = (float *)(nram_buffer);
-    float *float_dst_nram_mlu = (float *)(nram_buffer);
-    __wram__ float float_src1_nram_mlu[data_nram_num_mlu];
-
-    for (unsigned int i = 0; i < loop_num_mlu; ++i){
-        __memcpy(float_src0_nram_mlu, src0_offset_mlu + i * data_nram_num_mlu, data_nram_num_mlu * sizeof(float), GDRAM2NRAM);
-        __memcpy(float_src1_nram_mlu, src1_offset_mlu + i * data_nram_num_mlu, data_nram_num_mlu * sizeof(float), GDRAM2WRAM);
-        __bang_matmul(float_dst_nram_mlu, float_src0_nram_mlu, float_src1_nram_mlu, 256, 256, 256);
-        __memcpy(dst_offset_mlu + i * data_nram_num_mlu, float_dst_nram_mlu, data_nram_num_mlu * sizeof(float), NRAM2GDRAM);
-    }
-    if (rem_nram_num_mlu != 0){
-        __memcpy(float_src0_nram_mlu, src0_offset_mlu + loop_num_mlu * rem_nram_num_mlu, rem_nram_num_mlu * sizeof(float), GDRAM2NRAM);
-        __memcpy(float_src1_nram_mlu, src1_offset_mlu + loop_num_mlu * rem_nram_num_mlu, rem_nram_num_mlu * sizeof(float), GDRAM2WRAM);
-        __bang_matmul(float_dst_nram_mlu, float_src0_nram_mlu, float_src1_nram_mlu, 256, 256, 256);
-        __memcpy(dst_offset_mlu + loop_num_mlu * rem_nram_num_mlu, float_dst_nram_mlu, rem_nram_num_mlu * sizeof(float), NRAM2GDRAM);
-    }*/
-
 }
 
 __mlu_global__ void adjustBrightnessKernel(uint8_t* dst, const uint8_t* src, const int data_num, const float alpha) {
@@ -724,38 +910,6 @@ __mlu_global__ void adjustBrightnessKernel(uint8_t* dst, const uint8_t* src, con
         __bang_float2uchar(uint8_dst_nram, float_dst_nram, rem_nram_num);
         __memcpy(dst_offset + loop_num * data_nram_num, uint8_dst_nram, rem_nram_num * sizeof(uint8_t), NRAM2GDRAM);
     }
-    /*
-    int data_num_mlu = mul * mul;
-    int32_t data_per_core_mlu = data_num_mlu / taskDim;
-    int32_t data_last_core_mlu = data_per_core_mlu + data_num_mlu % taskDim;
-    const float* src0_offset_mlu = src0_mlu + taskId * data_per_core_mlu;
-    const float* src1_offset_mlu = src1_mlu + taskId * data_per_core_mlu;
-    float* dst_offset_mlu = dst_mlu + taskId * data_per_core_mlu;
-
-    if (taskId == taskDim - 1) {
-        data_per_core_mlu = data_last_core_mlu;
-    }
-
-    const unsigned int data_nram_num_mlu = 256*256;
-    const unsigned int loop_num_mlu = data_per_core_mlu / data_nram_num_mlu;
-    const unsigned int rem_nram_num_mlu = data_per_core_mlu % data_nram_num_mlu;  
-    
-    float *float_src0_nram_mlu = (float *)(nram_buffer);
-    float *float_dst_nram_mlu = (float *)(nram_buffer);
-    __wram__ float float_src1_nram_mlu[data_nram_num_mlu];
-
-    for (unsigned int i = 0; i < loop_num_mlu; ++i){
-        __memcpy(float_src0_nram_mlu, src0_offset_mlu + i * data_nram_num_mlu, data_nram_num_mlu * sizeof(float), GDRAM2NRAM);
-        __memcpy(float_src1_nram_mlu, src1_offset_mlu + i * data_nram_num_mlu, data_nram_num_mlu * sizeof(float), GDRAM2WRAM);
-        __bang_matmul(float_dst_nram_mlu, float_src0_nram_mlu, float_src1_nram_mlu, 256, 256, 256);
-        __memcpy(dst_offset_mlu + i * data_nram_num_mlu, float_dst_nram_mlu, data_nram_num_mlu * sizeof(float), NRAM2GDRAM);
-    }
-    if (rem_nram_num_mlu != 0){
-        __memcpy(float_src0_nram_mlu, src0_offset_mlu + loop_num_mlu * rem_nram_num_mlu, rem_nram_num_mlu * sizeof(float), GDRAM2NRAM);
-        __memcpy(float_src1_nram_mlu, src1_offset_mlu + loop_num_mlu * rem_nram_num_mlu, rem_nram_num_mlu * sizeof(float), GDRAM2WRAM);
-        __bang_matmul(float_dst_nram_mlu, float_src0_nram_mlu, float_src1_nram_mlu, 256, 256, 256);
-        __memcpy(dst_offset_mlu + loop_num_mlu * rem_nram_num_mlu, float_dst_nram_mlu, rem_nram_num_mlu * sizeof(float), NRAM2GDRAM);
-    }*/
 }
 
 
@@ -804,29 +958,7 @@ extern "C" {
 
       float scale_x = static_cast<float>(src_width) / width;
       float scale_y = static_cast<float>(src_height) / height;
-      /*unsigned int M = 950;
-      unsigned int K = 950;
-      unsigned int N = 950;
-      float *src0 = (float *)malloc(M * K * sizeof(float));
-      float *src2 = (float *)malloc(K * N * sizeof(float));
 
-      for (unsigned int i = 0; i < M * K; i++) {
-          src0[i] = (float)(i + 1);
-      }
-      for (unsigned int i = 0; i < K * N; i++) {
-          src2[i] = (float)(i + 1);
-      }
-
-      float *src0_mlu;
-      float *src1_mlu;
-      float *dst_mlu;
-      CNRT_CHECK(cnrtMalloc((void**)&src0_mlu, M * K * sizeof(float)));
-      CNRT_CHECK(cnrtMalloc((void**)&src1_mlu, K * N * sizeof(float)));
-      CNRT_CHECK(cnrtMalloc((void**)&dst_mlu, M * N * sizeof(float)));
-    
-      CNRT_CHECK(cnrtMemcpy(src0_mlu, src0, M * K * sizeof(float), cnrtMemcpyHostToDev));
-      CNRT_CHECK(cnrtMemcpy(src1_mlu, src2, K * N * sizeof(float), cnrtMemcpyHostToDev));
-      //CNRT_CHECK(cnrtMemcpy(dst_mlu, dst_c, M * N * sizeof(float), cnrtMemcpyHostToDev));*/
       uint32_t *index = (uint32_t *)malloc(imgnew_size*sizeof(uint32_t));
       //#pragma omp parallel for num_threads(39)
       for (int j = 0; j < height; ++j) {
@@ -858,7 +990,7 @@ extern "C" {
        CNRT_CHECK(cnrtMalloc((void**)&mlu_index, imgnew_size * sizeof(uint32_t)));
        CNRT_CHECK(cnrtMemcpy(mlu_index, index, imgnew_size * sizeof(uint32_t), cnrtMemcpyHostToDev));
        CNRT_CHECK(cnrtMemcpy(mlu_src, host_src, 3 * src_width * src_height * sizeof(uchar), cnrtMemcpyHostToDev));
-       resizeNearestKernel<<<dim, ktype,__queue>>>(mlu_dst, mlu_src, mlu_index,src_size, dst_size);
+       resizeKernel<<<dim, ktype,__queue>>>(mlu_dst, mlu_src, mlu_index,src_size, dst_size);
 
        CNRT_CHECK(cnrtQueueSync(__queue));
        CNRT_CHECK(cnrtMemcpy(host_dst, mlu_dst, imgnew_size * sizeof(uchar), cnrtMemcpyDevToHost));
